@@ -1,6 +1,6 @@
 # GiftFlow: AI-assisted intake for donation checks and gift-in-kind forms
 
-**[▶ Live demo](https://26usng9vfwyj7e4jisrz6w.streamlit.app/)** · runs in offline demo mode on synthetic data. Click **Run intake**, then open **Review**. (If it's been idle, it takes about 30 seconds to wake up.)
+**[▶ Live demo](https://giftflow-demo.streamlit.app/)** · runs in offline demo mode on synthetic data. Click **Run intake**, then open **Review**. (If it's been idle, it takes about 30 seconds to wake up.)
 
 GiftFlow reads scanned donation checks and in-kind donation forms, extracts the data with OCR and an LLM, suggests the donor match and fund/campaign coding, **checks the AI's work in code**, and puts every gift in front of a **person for approval** before anything is posted. Posted gifts reconcile against the bank deposit slip, and every step is written to an audit log.
 
