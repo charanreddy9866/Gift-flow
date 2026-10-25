@@ -1,0 +1,150 @@
+"""Validation: code checks the AI's work before any person sees it.
+
+"block" flags must be fixed before a gift can be approved.
+"warn" flags are shown first in the review queue so a person looks closely.
+"""
+from __future__ import annotations
+
+import sqlite3
+from datetime import date, timedelta
+
+from .amounts import words_to_amount
+from .db import allowed_codes, loads
+from .models import DonorCandidate, Flag
+
+STALE_CHECK_DAYS = 180
+MAX_REASONABLE_AMOUNT = 250_000
+
+
+def _block(code: str, msg: str) -> Flag:
+    return Flag(code=code, severity="block", message=msg)
+
+
+def _warn(code: str, msg: str) -> Flag:
+    return Flag(code=code, severity="warn", message=msg)
+
+
+def find_duplicates(conn: sqlite3.Connection, p: dict, document_id: int | None) -> list[Flag]:
+    """Same donor + check number + amount = the same check scanned twice."""
+    if p.get("doc_type") != "check" or not p.get("check_number") or p.get("amount") is None:
+        return []
+    flags: list[Flag] = []
+    if p.get("suggested_donor_id"):
+        posted = conn.execute(
+            "SELECT id FROM gifts WHERE gift_type='check' AND donor_id=? AND check_number=? AND amount=?",
+            (p["suggested_donor_id"], p["check_number"], p["amount"]),
+        ).fetchone()
+        if posted:
+            flags.append(_block("duplicate_posted",
+                                f"Check #{p['check_number']} for ${p['amount']:,.2f} was already posted (gift {posted['id']})."))
+    # Compare with earlier scans, and with anything already approved or posted.
+    # (The first copy of a check stays approvable; the second copy is flagged.)
+    if document_id is None:
+        rows = conn.execute(
+            "SELECT id, filename, proposal, final FROM documents WHERE status != 'rejected'").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, filename, proposal, final FROM documents WHERE status != 'rejected' AND id != ? "
+            "AND (id < ? OR status IN ('approved', 'posted'))",
+            (document_id, document_id),
+        ).fetchall()
+    for r in rows:
+        other = loads(r["final"]) or loads(r["proposal"]) or {}
+        same_donor = (other.get("suggested_donor_id") == p.get("suggested_donor_id")) or (
+            (other.get("donor_name") or "").lower() == (p.get("donor_name") or "").lower())
+        if (other.get("check_number") == p.get("check_number")
+                and other.get("amount") == p.get("amount") and same_donor):
+            flags.append(_block("duplicate_scan",
+                                f"Looks like the same check as {r['filename']} (same donor, check number and amount)."))
+            break
+    return flags
+
+
+def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandidate] | None = None,
+             ocr_confidence: float | None = None, low_conf_words: list[str] | None = None,
+             match_threshold: float = 85, ai_conf_threshold: float = 0.8,
+             ocr_conf_threshold: float = 70, document_id: int | None = None,
+             today: date | None = None) -> list[Flag]:
+    flags: list[Flag] = []
+    today = today or date.today()
+    funds, campaigns = allowed_codes(conn)
+    is_check = p.get("doc_type") == "check"
+
+    # --- required fields
+    required = ["donor_name", "amount", "date", "check_number"] if is_check else ["donor_name", "item_description", "date"]
+    missing = [f for f in required if p.get(f) in (None, "")]
+    if missing:
+        flags.append(_block("missing_fields", "Missing: " + ", ".join(missing) + ". Read it from the image."))
+
+    # --- amount checks
+    amount = p.get("amount")
+    if is_check and amount is not None:
+        if amount <= 0 or amount > MAX_REASONABLE_AMOUNT:
+            flags.append(_block("amount_invalid", f"Amount ${amount:,.2f} is outside the expected range."))
+        words_value = words_to_amount(p.get("amount_words"))
+        if p.get("amount_words") and words_value is None:
+            flags.append(_warn("amount_words_unreadable", "Couldn't read the written-out amount to cross-check."))
+        elif words_value is not None and abs(words_value - amount) > 0.009:
+            flags.append(_block("amount_mismatch",
+                                f"Amount box says ${amount:,.2f} but the written amount says ${words_value:,.2f}. Check the image."))
+
+    # --- OCR confidence (digits matter most: they are amounts and dates)
+    low = low_conf_words or []
+    risky = [w for w in low if any(ch.isdigit() for ch in w)]
+    if risky:
+        flags.append(_warn("ocr_low_conf_digits", "Low-confidence numbers from OCR: " + ", ".join(risky[:6])))
+    elif ocr_confidence is not None and ocr_confidence < ocr_conf_threshold:
+        flags.append(_warn("ocr_low_conf", f"Overall OCR confidence is low ({ocr_confidence:.0f}/100)."))
+
+    # --- date checks
+    if p.get("date"):
+        try:
+            d = date.fromisoformat(p["date"])
+            if d > today:
+                flags.append(_block("date_future", f"Date {d} is in the future."))
+            elif is_check and today - d > timedelta(days=STALE_CHECK_DAYS):
+                flags.append(_warn("stale_check", f"Check is dated {d}, more than {STALE_CHECK_DAYS} days ago."))
+        except ValueError:
+            flags.append(_block("date_invalid", f"Date '{p['date']}' isn't a valid date."))
+
+    # --- donor
+    if not p.get("suggested_donor_id"):
+        if candidates:
+            flags.append(_block("donor_required",
+                                f"Pick the donor. Closest match: {candidates[0].name} ({candidates[0].score:.0f}/100)."))
+        else:
+            flags.append(_block("donor_new", "No matching donor found. Confirm and create the donor record first."))
+    elif candidates:
+        chosen = next((c for c in candidates if c.donor_id == p["suggested_donor_id"]), None)
+        if chosen is None or chosen.score < match_threshold:
+            flags.append(_warn("donor_uncertain", "Donor match is below the confidence threshold. Confirm it."))
+        elif len(candidates) > 1 and candidates[1].score >= match_threshold - 5:
+            flags.append(_warn("donor_ambiguous",
+                               f"Two similar donors: {candidates[0].name} and {candidates[1].name}."))
+
+    # --- coding
+    fund, campaign = p.get("suggested_fund"), p.get("suggested_campaign")
+    if not fund or not campaign:
+        flags.append(_block("coding_required", "Fund and campaign are required."))
+    else:
+        if fund not in funds:
+            flags.append(_block("fund_invalid", f"Fund '{fund}' isn't in the fund list."))
+        if campaign not in campaigns:
+            flags.append(_block("campaign_invalid", f"Campaign '{campaign}' isn't in the campaign list."))
+    if p.get("coding_source") == "ai" and (p.get("ai_confidence") or 0) < ai_conf_threshold:
+        flags.append(_warn("coding_low_conf", "The AI wasn't sure about the fund/campaign. Check the memo."))
+
+    # --- gift-in-kind
+    if not is_check:
+        if p.get("stated_value") in (None, 0):
+            flags.append(_warn("gik_no_value", "No value stated by the donor. Staff record a value; the AI never assigns one."))
+        if not p.get("quantity"):
+            flags.append(_warn("gik_no_quantity", "Quantity is missing."))
+
+    # --- duplicates
+    flags.extend(find_duplicates(conn, p, document_id))
+    return flags
+
+
+def has_blockers(flags: list[Flag]) -> bool:
+    return any(f.severity == "block" for f in flags)
