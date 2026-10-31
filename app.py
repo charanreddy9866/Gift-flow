@@ -35,6 +35,11 @@ def get_conn():
 conn = get_conn()
 
 
+def md(text: str) -> str:
+    """Escape $ so Streamlit doesn't render text between two dollar amounts as a math formula."""
+    return str(text).replace("$", "\\$")
+
+
 def reset_demo_data() -> None:
     """Clear batches, documents, gifts and the audit log; keep the 10 seed donors."""
     for t in ["gifts", "documents", "batches", "audit_log"]:
@@ -165,7 +170,7 @@ with tab_review:
                     st.caption("AI reasoning: " + (loads(r["extraction"], {}).get("reasoning") or "—"))
                 with right:
                     for f in fl:
-                        (st.error if f["severity"] == "block" else st.warning)(f"**{f['code']}** — {f['message']}")
+                        (st.error if f["severity"] == "block" else st.warning)(f"**{f['code']}** — {md(f['message'])}")
                     if r["status"] == "approved":
                         st.success(f"Approved by {r['reviewer']}. Corrections: {', '.join(loads(r['corrections'], [])) or 'none'}")
                         continue
@@ -217,7 +222,7 @@ with tab_review:
                         except ApprovalBlocked as e:
                             for f in e.flags:
                                 if f.severity == "block":
-                                    st.error(f"Can't approve yet: {f.message}")
+                                    st.error(f"Can't approve yet: {md(f.message)}")
                     if do_reject:
                         reject(conn, r["id"], reviewer, "rejected in review")
                         st.rerun()
@@ -249,7 +254,7 @@ with tab_post:
         if rec["status"] == "balanced":
             st.success("Balanced: approved and posted checks match the bank deposit.")
         else:
-            st.warning(f"Not balanced yet ({rec['status']} by ${abs(rec['difference']):,.2f}). Finish reviewing, or look for a misread or duplicate.")
+            st.warning(md(f"Not balanced yet ({rec['status']} by ${abs(rec['difference']):,.2f}). Finish reviewing, or look for a misread or duplicate."))
 
         approved = conn.execute("SELECT COUNT(*) FROM documents WHERE batch_id=? AND status='approved'", (batch_id,)).fetchone()[0]
         if st.button(f"Post {approved} approved gift(s)", type="primary", disabled=approved == 0):
