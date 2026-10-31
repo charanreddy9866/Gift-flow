@@ -60,6 +60,16 @@ streamlit run app.py
 
 Click **Run intake** with "Use the sample batch" on, then open **Review**.
 
+**Or run it with Docker** (includes Tesseract OCR):
+
+```bash
+docker build -t giftflow .
+docker run --rm -p 8501:8501 giftflow                     # offline mock AI
+docker run --rm -p 8501:8501 --env-file .env giftflow     # real OpenAI, see below
+```
+
+Open http://localhost:8501. Add `-v giftflow-data:/data` to keep the database between runs.
+
 **Use the real OpenAI model:** copy `.env.example` to `.env`, set `LLM_PROVIDER=openai` and `OPENAI_API_KEY=...`. The key is read from the environment and never stored in code.
 
 Other commands:
