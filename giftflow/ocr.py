@@ -28,11 +28,12 @@ def crop_bank_strip(image: Image.Image) -> Image.Image:
     return image.crop((0, 0, w, int(h * (1 - BOTTOM_CROP_RATIO))))
 
 
-_LONG_DIGITS = re.compile(r"\b\d[\d\- ]{7,}\d\b")
+# 8 or more digits, optionally split by single spaces or hyphens (e.g. "0045-1237").
+_LONG_DIGITS = re.compile(r"\b\d(?:[\- ]?\d){7,}\b")
 
 
 def redact_bank_numbers(text: str) -> str:
-    """Mask any long run of digits (8+), which is never a gift amount or date."""
+    """Mask any run of 8+ digits, which is never a gift amount or date."""
     return _LONG_DIGITS.sub("[REDACTED]", text)
 
 
@@ -62,7 +63,7 @@ def run_ocr(image_path: str | Path, conf_threshold: float = 70) -> OcrResult:
         lines.setdefault(key, []).append(word)
         confs.append(conf)
         if conf < conf_threshold:
-            low.append(word)
+            low.append(redact_bank_numbers(word))  # stored in the DB, so redact too
     text = "\n".join(" ".join(ws) for _, ws in sorted(lines.items()))
     mean = round(sum(confs) / len(confs), 1) if confs else 0.0
     return OcrResult(redact_bank_numbers(text), mean, low)
