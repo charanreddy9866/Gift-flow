@@ -33,7 +33,7 @@ flowchart LR
 | Part | Job | File |
 | --- | --- | --- |
 | OCR | Image → text with word-level confidence. Crops the bank strip (MICR line) **before** reading, then redacts any 8+ digit number as a safety net | `giftflow/ocr.py` |
-| AI extraction | LLM returns a **strict JSON schema** (structured output). It can **call `search_donors`** (function calling) to look up the CRM; our code runs the lookup. Retries 429/5xx with exponential backoff. Document text is fenced as data, not instructions | `giftflow/llm.py` |
+| AI extraction | LLM returns a **strict JSON schema** (structured output). It can **call `search_donors`** (function calling) to look up the CRM; our code runs the lookup. Retries 429/5xx with exponential backoff. Document text is fenced as data, not instructions, and any `<<<`/`>>>` inside it is neutralised so it can't close the fence | `giftflow/llm.py` |
 | Offline mode | Deterministic mock extractor with the same interface and the same function call, so the app runs with no API key or internet | `giftflow/llm.py` |
 | Donor matching | Fuzzy name + address scoring with nickname handling (Bob → Robert). Never creates donors automatically | `giftflow/matching.py` |
 | Coding | Keyword rules first (predictable, free, auditable). AI suggestion only when no rule applies, and only from the allowed list | `giftflow/coding.py` |
@@ -67,7 +67,7 @@ Other commands:
 ```bash
 python scripts/generate_samples.py samples   # regenerate the synthetic batch
 python scripts/run_batch.py samples 6625     # process a folder from the terminal
-pytest -q                                    # 26 tests, no API key needed
+pytest -q                                    # 30 tests, no API key needed
 ```
 
 ## The 5-minute demo
@@ -97,7 +97,12 @@ pytest -q                                    # 26 tests, no API key needed
 | API rate limit / outage | 429 / 5xx / timeout | Exponential backoff with jitter; if it still fails, the document goes to review with the fields blank |
 | Posting fails halfway | Per-gift transactions | Re-run posting: only missing gifts post (idempotent) |
 | Gift-in-kind with no value | Empty value field | Warning; staff record the value |
-| Bank numbers exposed | Cropped before OCR, redacted after | Never stored and never sent to the AI |
+| Bank numbers exposed | Cropped before OCR, redacted after (OCR text and low-confidence word list) | Never stored and never sent to the AI; `tests/test_safety.py` checks every model request, DB row and audit entry |
+| Prompt injection in a document | Document text is fenced; fence markers inside it are neutralised | Strict schema, allowed code lists, code validation and human approval limit what a bad extraction can do |
+
+## What the AI sees
+
+Only bank numbers are redacted. The model receives the donor name, address, amount, date, memo and check number from the document, and the `search_donors` tool returns up to 3 CRM candidates (name, address, score) to it. Use a provider and account whose data-handling terms fit donor data before switching from mock mode.
 
 ## Design decisions
 
