@@ -85,3 +85,21 @@ def test_works_without_tesseract(conn, settings, samples, tmp_path, monkeypatch)
     rows = {r["filename"]: r for r in conn.execute("SELECT * FROM documents WHERE batch_id=?", (b,))}
     assert loads(rows["01_check_robert_smith.png"]["proposal"])["amount"] == 250.0
     assert "ocr_failed" in _flags(rows["bare.png"])
+
+
+def test_creating_donor_selects_it_and_clears_the_flag(conn, settings, samples):
+    from giftflow.review import create_donor_for_document
+
+    batch = create_batch(conn, "test", 6625.00)
+    process_batch(conn, batch, sorted(samples.glob("*.png")), MockExtractor(), settings)
+    doc = _doc(conn, "07_")
+    assert "donor_new" in _flags(doc)
+    assert "coding_low_conf" not in _flags(doc)          # "General donation" is coded by rule
+    assert loads(doc["proposal"])["suggested_fund"] == "GENERAL"
+
+    kid = create_donor_for_document(conn, doc["id"], "Kevin O'Brien", "45 Elm St, Plantation, FL 33317",
+                                    "tester", settings)
+    doc = _doc(conn, "07_")
+    assert loads(doc["proposal"])["suggested_donor_id"] == kid
+    assert "donor_new" not in _flags(doc)
+    approve(conn, doc["id"], {}, "tester", settings)      # nothing left blocking

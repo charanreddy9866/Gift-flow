@@ -13,6 +13,8 @@ RULES: list[tuple[tuple[str, ...], str, str]] = [
     (("christmas", "holiday", "holidays"), "GENERAL", "HOLIDAY-2026"),
     (("meal", "meals", "food", "kitchen"), "MEALS", "ANNUAL-2026"),
     (("shelter", "beds", "coats", "blankets"), "SHELTER", "ANNUAL-2026"),
+    (("general donation", "general fund", "unrestricted", "where needed", "where most needed"),
+     "GENERAL", "ANNUAL-2026"),
 ]
 
 
