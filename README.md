@@ -60,6 +60,16 @@ streamlit run app.py
 
 Click **Run intake** with "Use the sample batch" on, then open **Review**.
 
+**Or run it with Docker** (includes Tesseract OCR):
+
+```bash
+docker build -t giftflow .
+docker run --rm -p 8501:8501 giftflow                     # offline mock AI
+docker run --rm -p 8501:8501 --env-file .env giftflow     # real OpenAI, see below
+```
+
+Open http://localhost:8501. Add `-v giftflow-data:/data` to keep the database between runs.
+
 **Use the real OpenAI model:** copy `.env.example` to `.env`, set `LLM_PROVIDER=openai` and `OPENAI_API_KEY=...`. The key is read from the environment and never stored in code.
 
 Other commands:
@@ -67,7 +77,7 @@ Other commands:
 ```bash
 python scripts/generate_samples.py samples   # regenerate the synthetic batch
 python scripts/run_batch.py samples 6625     # process a folder from the terminal
-pytest -q                                    # 30 tests, no API key needed
+pytest -q                                    # 31 tests, no API key needed
 ```
 
 ## The 5-minute demo
@@ -76,7 +86,7 @@ pytest -q                                    # 30 tests, no API key needed
 2. **Review:** flagged items are first.
    - `05` Angela Davis-Reed: amount box says **$175.00**, written amount says **$150.00** → blocked. The written amount is the legal amount, so correct it to 150 and approve.
    - `06` Robert Smith: the same check scanned twice → blocked as a duplicate → reject it.
-   - `07` Kevin O'Brien: no matching donor → a person creates the donor, then approves.
+   - `07` Kevin O'Brien: no matching donor → a person creates the donor (it is selected automatically), then approves.
    - `08` "R. Smith": two similar donors; the **address** points to Robert Smithson → pick him and approve.
    - `02` "Bob Martinez" matched to **Robert** Martinez through nickname handling.
    - `09` In-kind coats with no stated value → warning; the AI never assigns a value.

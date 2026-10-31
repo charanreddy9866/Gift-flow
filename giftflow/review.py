@@ -57,6 +57,27 @@ def create_donor(conn: sqlite3.Connection, name: str, address: str | None, revie
     return cur.lastrowid
 
 
+def create_donor_for_document(conn: sqlite3.Connection, doc_id: int, name: str, address: str | None,
+                              reviewer: str, settings: Settings) -> int:
+    """A person creates the donor from the review screen. The new donor becomes the
+    document's suggested donor, and its flags are re-checked so the screen is current."""
+    donor_id = create_donor(conn, name, address, reviewer)
+    row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if row is None or row["status"] in ("approved", "posted"):
+        return donor_id
+    proposal = {**loads(row["proposal"], {}), "suggested_donor_id": donor_id}
+    candidates = search_donors(conn, proposal.get("donor_name"), proposal.get("address"))
+    flags = validate(conn, proposal, candidates=candidates, ocr_confidence=row["ocr_confidence"],
+                     low_conf_words=loads(row["low_conf_words"], []),
+                     match_threshold=settings.match_threshold, ai_conf_threshold=settings.ai_conf_threshold,
+                     ocr_conf_threshold=settings.ocr_conf_threshold, document_id=doc_id)
+    conn.execute("UPDATE documents SET proposal=?, candidates=?, flags=? WHERE id=?",
+                 (json.dumps(proposal), json.dumps([c.model_dump() for c in candidates]),
+                  json.dumps([f.model_dump() for f in flags]), doc_id))
+    conn.commit()
+    return donor_id
+
+
 def reject(conn: sqlite3.Connection, doc_id: int, reviewer: str, reason: str) -> None:
     conn.execute("UPDATE documents SET status='rejected', reviewer=?, reviewed_at=? WHERE id=? AND status!='posted'",
                  (reviewer, now(), doc_id))

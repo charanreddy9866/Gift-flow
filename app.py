@@ -14,7 +14,7 @@ from giftflow.db import allowed_codes, connect, init_db, loads
 from giftflow.llm import get_extractor
 from giftflow.pipeline import create_batch, process_batch
 from giftflow.posting import export_gift_csv, post_batch, reconcile
-from giftflow.review import ApprovalBlocked, accuracy_metrics, approve, create_donor, reject
+from giftflow.review import ApprovalBlocked, accuracy_metrics, approve, create_donor_for_document, reject
 
 ROOT = Path(__file__).parent
 SAMPLES = ROOT / "samples"
@@ -34,6 +34,15 @@ def get_conn():
 
 conn = get_conn()
 
+
+def reset_demo_data() -> None:
+    """Clear batches, documents, gifts and the audit log; keep the 10 seed donors."""
+    for t in ["gifts", "documents", "batches", "audit_log"]:
+        conn.execute(f"DELETE FROM {t}")
+    conn.execute("DELETE FROM donors WHERE id > 10")
+    conn.commit()
+
+
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.title("GiftFlow")
@@ -51,10 +60,7 @@ with st.sidebar:
         "8. Reconcile with deposit"
     )
     if st.button("Reset demo data", type="secondary"):
-        for t in ["gifts", "documents", "batches", "audit_log"]:
-            conn.execute(f"DELETE FROM {t}")
-        conn.execute("DELETE FROM donors WHERE id > 10")
-        conn.commit()
+        reset_demo_data()
         st.rerun()
 
 tab_intake, tab_review, tab_post, tab_accuracy, tab_audit = st.tabs(
@@ -69,11 +75,14 @@ with tab_intake:
     name = c1.text_input("Batch name", value="Sample deposit" if use_samples else "")
     deposit = c2.number_input("Deposit slip total ($)", min_value=0.0, step=0.01,
                               value=SAMPLE_DEPOSIT if use_samples else 0.0)
+    if use_samples:
+        st.caption("Running the sample batch starts the demo fresh, so earlier runs don't show up as duplicate scans.")
     uploads = None if use_samples else st.file_uploader(
         "Scanned images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
     if st.button("Run intake", type="primary", disabled=not name):
         if use_samples:
+            reset_demo_data()
             if not any(SAMPLES.glob("*.png")):
                 from scripts.generate_samples import main as gen
                 gen(str(SAMPLES))
@@ -171,7 +180,8 @@ with tab_review:
                             "Donor", options, index=options.index(current) if current in options else 0,
                             format_func=lambda i, sc=scores: "— pick a donor —" if i is None else (
                                 donor_label[i] + (f"  ·  match {sc[i]:.0f}" if i in sc else "")),
-                            key=f"donor_{r['id']}")
+                            # key includes the suggestion, so the box resets when a donor is created
+                            key=f"donor_{r['id']}_{current}")
                         c1, c2 = st.columns(2)
                         if r["doc_type"] == "check":
                             amt = c1.number_input("Amount ($)", value=p.get("amount"), min_value=0.0, step=0.01,
@@ -218,8 +228,11 @@ with tab_review:
                             nn = st.text_input("Name", value=p.get("donor_name") or "", key=f"nn_{r['id']}")
                             na = st.text_input("Address", value=p.get("address") or "", key=f"na_{r['id']}")
                             if st.form_submit_button("Create donor"):
-                                create_donor(conn, nn, na or None, reviewer)
-                                st.rerun()
+                                if not nn.strip():
+                                    st.error("Enter the donor's name.")
+                                else:
+                                    create_donor_for_document(conn, r["id"], nn, na or None, reviewer, settings)
+                                    st.rerun()
 
 # ------------------------------------------------------------------ post & reconcile
 with tab_post:
