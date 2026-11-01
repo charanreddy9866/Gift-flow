@@ -16,7 +16,7 @@ Manually reading each check, matching the donor, choosing the fund and campaign,
 
 ```mermaid
 flowchart LR
-    A[1 Scan batch] --> B[2 OCR<br/>bank strip cropped<br/>numbers redacted]
+    A[1 Scan batch<br/>bank strip masked<br/>before saving] --> B[2 OCR<br/>bank strip cropped<br/>numbers redacted]
     B --> C[3 AI extracts fields<br/>structured output]
     C <-->|function call| D[(CRM<br/>search_donors)]
     C --> E[4 Rules code<br/>fund + campaign]
@@ -32,13 +32,14 @@ flowchart LR
 
 | Part | Job | File |
 | --- | --- | --- |
-| OCR | Image → text with word-level confidence. Crops the bank strip (MICR line) **before** reading, then redacts any 8+ digit number as a safety net | `giftflow/ocr.py` |
+| Saving uploads | Paints over the bank strip (MICR line) **before** the file is written, so the unmasked original never reaches disk. The masked image is OCR'd first; if any 8+ digit run is still readable, or Tesseract isn't available to check, the upload is refused and nothing is saved | `giftflow/ocr.py` |
+| OCR | Image → text with word-level confidence. Crops the bank strip before reading, then redacts any 8+ digit number in the text and the low-confidence word list | `giftflow/ocr.py` |
 | AI extraction | LLM returns a **strict JSON schema** (structured output). It can **call `search_donors`** (function calling) to look up the CRM; our code runs the lookup. Retries 429/5xx with exponential backoff. Document text is fenced as data, not instructions, and any `<<<`/`>>>` inside it is neutralised so it can't close the fence | `giftflow/llm.py` |
 | Offline mode | Deterministic mock extractor with the same interface and the same function call, so the app runs with no API key or internet | `giftflow/llm.py` |
 | Donor matching | Fuzzy name + address scoring with nickname handling (Bob → Robert). Never creates donors automatically | `giftflow/matching.py` |
 | Coding | Keyword rules first (predictable, free, auditable). AI suggestion only when no rule applies, and only from the allowed list | `giftflow/coding.py` |
-| Validation | Required fields, amount box vs written amount, OCR low-confidence digits, future/stale dates, donor certainty, valid codes, GIK value, duplicates | `giftflow/validate.py` |
-| Review | Re-validates the reviewer's version; blocking issues prevent approval; records every correction | `giftflow/review.py` |
+| Validation | Required fields, amount box vs written amount, AI amount vs the OCR text, more than one amount on a check, OCR low-confidence digits, future/stale dates, AI donor pick vs its own search results, donor exists, donor certainty, valid codes, AI-chosen coding, GIK value, duplicates | `giftflow/validate.py` |
+| Review | Re-validates the reviewer's version with the stored OCR text and AI tool calls; blocking issues prevent approval; records every correction and every [confirmation](#reviewer-confirmations) | `giftflow/review.py` |
 | Posting | One transaction per gift; unique constraints make re-running safe and stop the same check posting twice | `giftflow/posting.py` |
 | Reconciliation | Posted + approved check totals must equal the deposit slip | `giftflow/posting.py` |
 | App | Streamlit: intake, review queue, post & reconcile, accuracy, audit log | `app.py` |
@@ -46,9 +47,11 @@ flowchart LR
 ## Run it
 
 ```bash
-# 1. Install Tesseract OCR (optional: without it, the demo uses the .txt OCR files next to each sample)
+# 1. Install Tesseract OCR. Without it the sample batch still runs (from the .txt OCR
+#    files next to each sample), but uploaded scans are refused: they can't be checked for bank numbers.
 brew install tesseract          # macOS
-# sudo apt install tesseract-ocr   (Ubuntu)
+# sudo apt install tesseract-ocr                 (Ubuntu)
+# winget install UB-Mannheim.TesseractOCR        (Windows; then add C:\Program Files\Tesseract-OCR to PATH)
 
 # 2. Install Python packages
 python -m venv .venv && source .venv/bin/activate
@@ -77,7 +80,7 @@ Other commands:
 ```bash
 python scripts/generate_samples.py samples   # regenerate the synthetic batch
 python scripts/run_batch.py samples 6625     # process a folder from the terminal
-pytest -q                                    # 31 tests, no API key needed
+pytest -q                                    # 78 tests, no API key needed; the 27 real-OCR tests skip without Tesseract
 ```
 
 ## The 5-minute demo
@@ -88,11 +91,13 @@ pytest -q                                    # 31 tests, no API key needed
    - `06` Robert Smith: the same check scanned twice → blocked as a duplicate → reject it.
    - `07` Kevin O'Brien: no matching donor → a person creates the donor (it is selected automatically), then approves.
    - `08` "R. Smith": two similar donors; the **address** points to Robert Smithson → pick him and approve.
-   - `02` "Bob Martinez" matched to **Robert** Martinez through nickname handling.
+   - `02` "Bob Martinez" matched to **Robert** Martinez through nickname handling. The memo is blank, so the fund/campaign is the AI's pick → tick "I've checked the fund and campaign" to approve.
    - `09` In-kind coats with no stated value → warning; the AI never assigns a value.
 3. **Post & reconcile:** post 9 gifts → posted checks = **$6,625.00** = deposit slip → **balanced**. Download the gift import CSV.
 4. **Accuracy:** the share of AI proposals accepted unchanged, and which fields reviewers corrected most.
-5. **Audit log:** every AI step, approval, donor creation and posting, with who and when.
+5. **Audit log:** every AI step, approval, reviewer confirmation, donor creation and posting, with who and when.
+
+The sample images are synthetic and shown as generated, bank line included. Uploaded scans are masked before they're saved.
 
 ![Reconciliation](docs/03_reconcile.png)
 
@@ -107,8 +112,21 @@ pytest -q                                    # 31 tests, no API key needed
 | API rate limit / outage | 429 / 5xx / timeout | Exponential backoff with jitter; if it still fails, the document goes to review with the fields blank |
 | Posting fails halfway | Per-gift transactions | Re-run posting: only missing gifts post (idempotent) |
 | Gift-in-kind with no value | Empty value field | Warning; staff record the value |
-| Bank numbers exposed | Cropped before OCR, redacted after (OCR text and low-confidence word list) | Never stored and never sent to the AI; `tests/test_safety.py` checks every model request, DB row and audit entry |
-| Prompt injection in a document | Document text is fenced; fence markers inside it are neutralised | Strict schema, allowed code lists, code validation and human approval limit what a bad extraction can do |
+| Bank numbers exposed | Masked in uploaded images before saving; cropped before OCR and redacted after (OCR text and low-confidence word list) | Upload refused if the masked image still shows an 8+ digit run; `tests/test_safety.py` checks every model request, DB row, audit entry and saved image |
+| Prompt injection in a document | Document text is fenced; fence markers inside it are neutralised | The AI's output is checked against things it can't change: the OCR text, its own donor search results, the donor table, rule coding. Mismatches block until a person fixes or [confirms](#reviewer-confirmations) them; `tests/test_safety.py` feeds in hostile model answers |
+
+## Reviewer confirmations
+
+Some checks block approval of what the AI proposed until the reviewer either changes the field or ticks a confirmation on the review form. A confirmation turns the block into a warning and writes an audit entry with the reviewer's name. Ticking a box when it isn't needed logs nothing.
+
+| Blocks when | Flag | Cleared by | Audit action (details) |
+| --- | --- | --- | --- |
+| The AI's donor wasn't returned by its own `search_donors` calls | `donor_not_searched` | Picking another donor, or "I've verified this donor" | `donor_confirmed_unsearched` (donor ID) |
+| The AI's amount doesn't appear as a dollar amount in the OCR text | `amount_not_in_ocr` | Typing a different amount, or "I've verified this amount" | `amount_confirmed_not_in_ocr` (amount) |
+| The OCR text shows more than one dollar amount (e.g. a fake one in the memo) | `amount_multiple_in_ocr` | "I've verified this amount" only, even if the reviewer typed the amount | `amount_confirmed_multiple_in_ocr` (amount, amounts in the scan) |
+| No coding rule matched, so the fund/campaign is the AI's pick, whatever confidence it reports | `coding_ai_chosen` | Picking both codes, or "I've checked the fund and campaign" | `coding_confirmed` (fund, campaign, the AI's claimed confidence) |
+
+A donor ID that doesn't exist (`donor_not_found`) always blocks; no confirmation clears it.
 
 ## What the AI sees
 
@@ -120,6 +138,7 @@ Only bank numbers are redacted. The model receives the donor name, address, amou
 - **Rules before AI for coding:** known keywords are free, instant and predictable. The AI handles the long tail.
 - **Human approval for everything:** it's money and donor records. The path to automation is to measure acceptance rates per category, then auto-approve only what's proven.
 - **Function calling for the donor lookup:** the model asks; our code runs the query and decides what to return. The model never touches the database directly.
+- **Never trust the model's own confidence:** a prompt injection can set `ai_confidence` to 1.0, so it never skips review. AI output is checked against independent evidence instead.
 - **Idempotent posting + unique constraints:** a retry or a double click can't double-post a gift.
 
 ## The same pattern for invoices and orders
