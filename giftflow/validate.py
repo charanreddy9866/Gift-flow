@@ -86,6 +86,7 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
              ai_donor_id: int | None = None, tool_calls: list[dict] | None = None,
              donor_confirmed: bool = False, ocr_text: str | None = None,
              ai_amount: float | None = None, amount_confirmed: bool = False,
+             ai_coding: tuple[str | None, str | None] | None = None, coding_confirmed: bool = False,
              today: date | None = None) -> list[Flag]:
     """`ai_donor_id` and `tool_calls` are the AI's raw donor choice and its function
     calls. When given, an AI-chosen donor must be one its own search returned, unless
@@ -94,7 +95,11 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
     `ocr_text` and `ai_amount`: when given, an AI-proposed check amount must appear as a
     dollar amount in the OCR text. An amount the reviewer typed in is not checked, and a
     reviewer who has verified the AI's amount against the image can confirm it
-    (`amount_confirmed`), e.g. when OCR misread the digits."""
+    (`amount_confirmed`), e.g. when OCR misread the digits.
+
+    `ai_coding`: the (fund, campaign) the AI suggested; defaults to `p`'s own when `p` is
+    AI-coded. Any AI-suggested fund or campaign still in `p` must be confirmed by the
+    reviewer (`coding_confirmed`). The model's ai_confidence never skips this."""
     flags: list[Flag] = []
     today = today or date.today()
     funds, campaigns = allowed_codes(conn)
@@ -118,13 +123,19 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
             flags.append(_block("amount_mismatch",
                                 f"Amount box says ${amount:,.2f} but the written amount says ${words_value:,.2f}. Check the image."))
         # More than one amount on a check (e.g. a fake one in the memo) means the OCR
-        # cross-check below can be satisfied by the wrong figure. Make a person look.
+        # cross-check below can be satisfied by the wrong figure. A person must check the
+        # image and confirm the amount, whoever entered it.
         distinct = sorted({round(v, 2) for v in ocr_dollar_amounts(ocr_text)})
         if len(distinct) > 1:
-            flags.append(_warn("amount_multiple_in_ocr",
-                               "The scanned text shows more than one dollar amount: "
-                               + ", ".join(f"${v:,.2f}" for v in distinct)
-                               + ". Check the image for the real check amount."))
+            listed = ", ".join(f"${v:,.2f}" for v in distinct)
+            if amount_confirmed:
+                flags.append(_warn("amount_multiple_in_ocr",
+                                   f"The scanned text shows more than one dollar amount ({listed}); "
+                                   f"a reviewer confirmed ${amount:,.2f} from the image."))
+            else:
+                flags.append(_block("amount_multiple_in_ocr",
+                                    f"The scanned text shows more than one dollar amount: {listed}. "
+                                    "Check the image for the real check amount and confirm it."))
         # The model supplies both the amount box and the written amount, so they can agree
         # and still be invented (e.g. by a prompt injection). Check against what OCR read.
         if ocr_text and ai_amount is not None and abs(amount - ai_amount) <= 0.009:
@@ -206,6 +217,21 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
             flags.append(_block("campaign_invalid", f"Campaign '{campaign}' isn't in the campaign list."))
     if p.get("coding_source") == "ai" and (p.get("ai_confidence") or 0) < ai_conf_threshold:
         flags.append(_warn("coding_low_conf", "The AI wasn't sure about the fund/campaign. Check the memo."))
+    # No rule matched, so the coding is the model's choice. Its self-reported confidence
+    # can be forced (e.g. by a prompt injection), so a person always confirms it.
+    if ai_coding is None and p.get("coding_source") == "ai":
+        ai_coding = (fund, campaign)
+    if ai_coding is not None:
+        kept = [code for code, ai_code in ((fund, ai_coding[0]), (campaign, ai_coding[1]))
+                if code and code == ai_code]
+        if kept:
+            if coding_confirmed:
+                flags.append(_warn("coding_ai_chosen",
+                                   f"The AI chose {' / '.join(kept)}; a reviewer confirmed the coding."))
+            else:
+                flags.append(_block("coding_ai_chosen",
+                                    f"The AI chose {' / '.join(kept)} (no coding rule matched the memo). "
+                                    "Pick the fund and campaign yourself, or confirm the AI's choice."))
 
     # --- gift-in-kind
     if not is_check:

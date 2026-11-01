@@ -10,7 +10,7 @@ from .config import Settings
 from .db import audit, loads, now
 from .matching import search_donors
 from .models import Flag
-from .validate import has_blockers, validate
+from .validate import has_blockers, ocr_dollar_amounts, validate
 
 TRACKED_FIELDS = ["donor_name", "amount", "date", "check_number", "memo", "item_description",
                   "quantity", "stated_value", "suggested_donor_id", "suggested_fund", "suggested_campaign"]
@@ -23,13 +23,16 @@ class ApprovalBlocked(Exception):
 
 
 def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, settings: Settings,
-            donor_confirmed: bool = False, amount_confirmed: bool = False) -> list[Flag]:
+            donor_confirmed: bool = False, amount_confirmed: bool = False,
+            coding_confirmed: bool = False) -> list[Flag]:
     """Re-validate the reviewer's version. Blocks approval if any blocking issue remains.
 
     `donor_confirmed`: the reviewer ticked "I've verified this donor", which lets an AI
     donor pick that its own search never returned through (and is audited).
     `amount_confirmed`: the reviewer ticked "I've verified this amount", which lets an AI
-    amount that doesn't appear in the OCR text through (and is audited)."""
+    amount that doesn't appear in the OCR text through (and is audited).
+    `coding_confirmed`: the reviewer ticked "I've checked the fund and campaign", which is
+    required whenever an AI-suggested fund or campaign is kept (and is audited)."""
     row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
     if row is None:
         raise ValueError(f"document {doc_id} not found")
@@ -43,15 +46,26 @@ def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, s
                      ai_donor_id=loads(row["extraction"], {}).get("suggested_donor_id"),
                      tool_calls=loads(row["tool_calls"], []), donor_confirmed=donor_confirmed,
                      ocr_text=row["ocr_text"], ai_amount=loads(row["extraction"], {}).get("amount"),
-                     amount_confirmed=amount_confirmed)
+                     amount_confirmed=amount_confirmed,
+                     ai_coding=(proposal.get("suggested_fund"), proposal.get("suggested_campaign"))
+                     if proposal.get("coding_source") == "ai" else None,
+                     coding_confirmed=coding_confirmed)
     if has_blockers(flags):
         raise ApprovalBlocked(flags)
+    if coding_confirmed and any(f.code == "coding_ai_chosen" for f in flags):
+        audit(conn, reviewer, "coding_confirmed", "document", doc_id,
+              {"fund": merged.get("suggested_fund"), "campaign": merged.get("suggested_campaign"),
+               "ai_confidence": proposal.get("ai_confidence")})
     if donor_confirmed and any(f.code == "donor_not_searched" for f in flags):
         audit(conn, reviewer, "donor_confirmed_unsearched", "document", doc_id,
               {"donor_id": merged.get("suggested_donor_id")})
     if amount_confirmed and any(f.code == "amount_not_in_ocr" for f in flags):
         audit(conn, reviewer, "amount_confirmed_not_in_ocr", "document", doc_id,
               {"amount": merged.get("amount")})
+    if amount_confirmed and any(f.code == "amount_multiple_in_ocr" for f in flags):
+        audit(conn, reviewer, "amount_confirmed_multiple_in_ocr", "document", doc_id,
+              {"amount": merged.get("amount"),
+               "ocr_amounts": sorted({round(v, 2) for v in ocr_dollar_amounts(row["ocr_text"])})})
     corrections = [f for f in TRACKED_FIELDS if proposal.get(f) != merged.get(f)]
     conn.execute(
         "UPDATE documents SET status='approved', final=?, corrections=?, flags=?, reviewer=?, reviewed_at=? WHERE id=?",

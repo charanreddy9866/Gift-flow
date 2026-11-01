@@ -8,6 +8,14 @@ from giftflow.posting import export_gift_csv, post_batch, reconcile
 from giftflow.review import ApprovalBlocked, accuracy_metrics, approve, create_donor, reject
 
 
+@pytest.fixture(autouse=True)
+def sidecar_ocr(monkeypatch):
+    """These tests check the pipeline, not OCR quality: hide Tesseract so every sample is
+    read from its .txt sidecar, with the same result whether or not Tesseract is installed."""
+    import pytesseract
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", "/nonexistent/tesseract")
+
+
 def _doc(conn, name):
     return conn.execute("SELECT * FROM documents WHERE filename LIKE ?", (f"{name}%",)).fetchone()
 
@@ -31,8 +39,14 @@ def test_full_batch(conn, settings, samples):
     for r in conn.execute("SELECT ocr_text FROM documents"):
         assert "063100277" not in r["ocr_text"] and "004512378901" not in r["ocr_text"]
 
-    for name in ["01_", "02_", "03_", "04_", "09_", "10_"]:
+    for name in ["01_", "03_", "04_", "09_", "10_"]:
         approve(conn, _doc(conn, name)["id"], {}, "tester", settings)
+
+    # 02_ has a blank memo, so the fund/campaign is the AI's pick: it needs confirming.
+    assert "coding_ai_chosen" in _flags(_doc(conn, "02_"))
+    with pytest.raises(ApprovalBlocked):
+        approve(conn, _doc(conn, "02_")["id"], {}, "tester", settings)
+    approve(conn, _doc(conn, "02_")["id"], {}, "tester", settings, coding_confirmed=True)
 
     with pytest.raises(ApprovalBlocked):
         approve(conn, _doc(conn, "05_")["id"], {}, "tester", settings)
@@ -57,7 +71,8 @@ def test_full_batch(conn, settings, samples):
     assert m["reviewed"] == 9 and "amount" in m["corrections_by_field"]
     assert "ConstituentID" in export_gift_csv(conn, batch)
     actions = {r["action"] for r in conn.execute("SELECT action FROM audit_log")}
-    assert {"document_processed", "document_approved", "donor_created", "gift_posted"} <= actions
+    assert {"document_processed", "document_approved", "donor_created", "gift_posted",
+            "coding_confirmed"} <= actions
 
 
 def test_same_check_cannot_post_twice_across_batches(conn, settings, samples):

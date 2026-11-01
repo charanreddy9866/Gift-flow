@@ -6,11 +6,12 @@ safety net, so bank numbers are never stored or sent to the AI.
 """
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 
 BOTTOM_CROP_RATIO = 0.14  # drop the bottom 14% of the page (MICR / bank line)
 
@@ -35,6 +36,41 @@ _LONG_DIGITS = re.compile(r"\b\d(?:[\- ]?\d){7,}\b")
 def redact_bank_numbers(text: str) -> str:
     """Mask any run of 8+ digits, which is never a gift amount or date."""
     return _LONG_DIGITS.sub("[REDACTED]", text)
+
+
+class BankNumbersVisible(Exception):
+    """The masked scan still shows a long digit run (or couldn't be checked), so it isn't saved."""
+
+
+def mask_bank_strip(image: Image.Image) -> Image.Image:
+    """Paint over the bottom strip (where the MICR line sits), keeping the page size.
+    EXIF rotation is applied first, so "bottom" means the bottom as displayed."""
+    image = ImageOps.exif_transpose(image)
+    image = image.convert("L" if image.mode == "L" else "RGB")
+    w, h = image.size
+    ImageDraw.Draw(image).rectangle((0, int(h * (1 - BOTTOM_CROP_RATIO)), w, h), fill="white")
+    return image
+
+
+def save_masked_upload(data: bytes, dest: str | Path) -> Path:
+    """Save an uploaded scan with the bank strip masked. The unmasked original is never
+    written. As a safety net the masked image is OCR'd first: if any run of 8+ digits is
+    still readable (e.g. a rotated scan, or the bank line sits higher), or the check
+    can't run because Tesseract is missing, nothing is saved and BankNumbersVisible is raised."""
+    dest = Path(dest)
+    masked = mask_bank_strip(Image.open(io.BytesIO(data)))
+    try:
+        import pytesseract
+
+        text = pytesseract.image_to_string(masked)
+    except Exception as exc:  # noqa: BLE001 - fail closed: unchecked images aren't saved
+        raise BankNumbersVisible(f"Couldn't check {dest.name} for bank numbers ({exc}); not saved.") from exc
+    if _LONG_DIGITS.search(text):
+        raise BankNumbersVisible(f"{dest.name} still shows a long number (possibly a bank account) "
+                                 "after masking; not saved. Rescan it upright and tightly cropped.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    masked.save(dest)  # re-encoded from pixels, so EXIF metadata is dropped too
+    return dest
 
 
 def run_ocr(image_path: str | Path, conf_threshold: float = 70) -> OcrResult:

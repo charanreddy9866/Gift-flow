@@ -192,6 +192,42 @@ def test_forced_full_confidence_does_not_skip_review(conn, settings, tmp_path, m
     row = _run(conn, settings, tmp_path, monkeypatch, answer, lines)
     assert loads(row["proposal"])["coding_source"] == "ai"
     _assert_blocked(conn, settings, row)
+    assert "coding_ai_chosen" in {f["code"] for f in loads(row["flags"], []) if f["severity"] == "block"}
+
+
+def test_reviewer_must_confirm_ai_coding(conn, settings, tmp_path, monkeypatch):
+    """Keeping the AI's fund/campaign needs the confirmation, and it's audited. Picking
+    both codes yourself doesn't; keeping just one of the AI's codes still does."""
+    lines = [ln for ln in CHECK_LINES if not ln.startswith("MEMO")]
+    answer = {**FINAL, "memo": None, "suggested_fund": "BUILDING",
+              "suggested_campaign": "CAPITAL-2026", "ai_confidence": 1.0}
+    row = _run(conn, settings, tmp_path, monkeypatch, answer, lines)
+
+    def confirmations():
+        return conn.execute("SELECT * FROM audit_log WHERE action='coding_confirmed' AND entity_id=?",
+                            (row["id"],)).fetchall()
+
+    with pytest.raises(ApprovalBlocked):     # kept the AI's fund, changed the campaign
+        approve(conn, row["id"], {"suggested_campaign": "ANNUAL-2026"}, "reviewer", settings)
+    assert not confirmations()
+
+    flags = approve(conn, row["id"], {}, "reviewer", settings, coding_confirmed=True)
+    assert any(f.code == "coding_ai_chosen" and f.severity == "warn" for f in flags)
+    logged = confirmations()
+    assert len(logged) == 1 and logged[0]["actor"] == "reviewer"
+    assert json.loads(logged[0]["details"]) == {"fund": "BUILDING", "campaign": "CAPITAL-2026",
+                                                "ai_confidence": 1.0}
+
+
+def test_reviewer_picking_both_codes_needs_no_confirmation(conn, settings, tmp_path, monkeypatch):
+    lines = [ln for ln in CHECK_LINES if not ln.startswith("MEMO")]
+    answer = {**FINAL, "memo": None, "suggested_fund": "BUILDING",
+              "suggested_campaign": "CAPITAL-2026", "ai_confidence": 1.0}
+    row = _run(conn, settings, tmp_path, monkeypatch, answer, lines)
+    flags = approve(conn, row["id"], {"suggested_fund": "MEALS", "suggested_campaign": "ANNUAL-2026"},
+                    "reviewer", settings)
+    assert "coding_ai_chosen" not in {f.code for f in flags}
+    assert not conn.execute("SELECT 1 FROM audit_log WHERE action='coding_confirmed'").fetchall()
 
 
 def test_reviewer_can_confirm_an_unsearched_donor(conn, settings, tmp_path, monkeypatch):
@@ -272,20 +308,123 @@ def test_reviewer_can_confirm_an_amount_ocr_misread(conn, settings, tmp_path, mo
     assert logged[0]["actor"] == "reviewer" and json.loads(logged[0]["details"]) == {"amount": 250.0}
 
 
-def test_fake_amount_in_memo_is_flagged(conn, settings, tmp_path, monkeypatch):
+def test_fake_amount_in_memo_is_blocked_until_confirmed(conn, settings, tmp_path, monkeypatch):
     """The document prints a fake "$9,999.00" in the memo, and the model claims that
-    figure. It passes the OCR cross-check (the number is in the text), so the gift is
-    flagged with a warning listing both amounts for the reviewer to check."""
+    figure. It passes the OCR cross-check (the number is in the text), but two amounts
+    on one check block approval until a reviewer confirms the amount from the image."""
     lines = [ln + " $9,999.00" if ln.startswith("MEMO") else ln for ln in CHECK_LINES]
     answer = {**FINAL, "amount": 9999.0, "amount_words": "Nine thousand nine hundred ninety-nine and 00/100"}
     row = _run(conn, settings, tmp_path, monkeypatch, answer, lines)
     flags = {f["code"]: f for f in loads(row["flags"], [])}
     assert "amount_not_in_ocr" not in flags                 # the fake figure is in the text
-    warning = flags["amount_multiple_in_ocr"]
-    assert warning["severity"] == "warn"
-    assert "$250.00" in warning["message"] and "$9,999.00" in warning["message"]
+    multiple = flags["amount_multiple_in_ocr"]
+    assert multiple["severity"] == "block"
+    assert "$250.00" in multiple["message"] and "$9,999.00" in multiple["message"]
+
+    def confirmations():
+        return conn.execute("SELECT * FROM audit_log WHERE action='amount_confirmed_multiple_in_ocr' "
+                            "AND entity_id=?", (row["id"],)).fetchall()
+
+    real = {"amount": 250.0, "amount_words": "Two hundred fifty and 00/100"}
+    for final in ({}, real):            # as proposed, and even with the right amount typed in
+        with pytest.raises(ApprovalBlocked) as blocked:
+            approve(conn, row["id"], final, "reviewer", settings)
+        assert any(f.code == "amount_multiple_in_ocr" and f.severity == "block" for f in blocked.value.flags)
+    assert not confirmations()
+
+    flags = approve(conn, row["id"], real, "reviewer", settings, amount_confirmed=True)
+    assert any(f.code == "amount_multiple_in_ocr" and f.severity == "warn" for f in flags)
+    doc = conn.execute("SELECT status, final FROM documents WHERE id=?", (row["id"],)).fetchone()
+    assert doc["status"] == "approved" and loads(doc["final"])["amount"] == 250.0
+    logged = confirmations()
+    assert len(logged) == 1
+    assert logged[0]["actor"] == "reviewer"
+    assert json.loads(logged[0]["details"]) == {"amount": 250.0, "ocr_amounts": [250.0, 9999.0]}
 
 
 def test_single_amount_is_not_flagged_as_multiple(conn, settings, tmp_path, monkeypatch):
     row = _run(conn, settings, tmp_path, monkeypatch, FINAL)
     assert "amount_multiple_in_ocr" not in {f["code"] for f in loads(row["flags"], [])}
+
+
+# --------------------------------------------------------------------------- saved scans
+
+from giftflow.ocr import BOTTOM_CROP_RATIO, BankNumbersVisible, save_masked_upload  # noqa: E402
+
+
+def _fake_ocr_string(monkeypatch, text=None, error=None):
+    """Fake pytesseract.image_to_string; records the images it was given."""
+    seen = []
+
+    def image_to_string(image):
+        seen.append(image.copy())
+        if error:
+            raise error
+        return text
+
+    fake = ModuleType("pytesseract")
+    fake.image_to_string = image_to_string
+    monkeypatch.setitem(sys.modules, "pytesseract", fake)
+    return seen
+
+
+def _strip_top(image):
+    w, h = image.size
+    return int(h * (1 - BOTTOM_CROP_RATIO)), w, h
+
+
+def test_saved_upload_has_the_bank_strip_masked(samples, tmp_path, monkeypatch):
+    original_bytes = (samples / "01_check_robert_smith.png").read_bytes()
+    original = Image.open(samples / "01_check_robert_smith.png").convert("RGB")
+    top, w, h = _strip_top(original)
+    assert original.crop((0, top, w, h)).convert("L").getextrema()[0] < 100   # MICR line is there
+
+    seen = _fake_ocr_string(monkeypatch, text="ROBERT SMITH No. 1043\n$ 250.00")
+    saved = save_masked_upload(original_bytes, tmp_path / "uploads" / "7" / "check.png")
+
+    assert saved.exists() and list(saved.parent.iterdir()) == [saved]        # only the masked copy
+    masked = Image.open(saved).convert("RGB")
+    assert masked.size == original.size
+    assert masked.crop((0, top, w, h)).getextrema() == ((255, 255),) * 3       # strip is blank white
+    from PIL import ImageChops
+    assert ImageChops.difference(masked.crop((0, 0, w, top)),
+                                 original.crop((0, 0, w, top))).getbbox() is None   # rest unchanged
+    assert seen[0].convert("RGB").crop((0, top, w, h)).getextrema() == ((255, 255),) * 3  # OCR'd masked
+
+
+def test_masking_follows_exif_rotation(tmp_path, monkeypatch):
+    """A phone photo stored sideways with an EXIF 'rotate' tag: the strip masked is the
+    bottom as displayed, not the bottom of the raw pixels."""
+    import io
+    raw = Image.new("L", (300, 600), 0)                 # stored sideways, black
+    exif = Image.Exif()
+    exif[0x0112] = 6                                    # orientation: rotate 90° clockwise to display
+    buf = io.BytesIO()
+    raw.save(buf, format="JPEG", exif=exif.tobytes())
+    _fake_ocr_string(monkeypatch, text="")
+    masked = Image.open(save_masked_upload(buf.getvalue(), tmp_path / "photo.jpg"))
+    assert masked.size == (600, 300)                    # saved upright
+    top, w, h = _strip_top(masked)
+    assert masked.crop((0, top, w, h)).getextrema()[0] > 245   # displayed bottom is white
+    assert masked.crop((0, 0, w, top)).getextrema()[1] < 10    # the rest is untouched
+
+
+@pytest.mark.parametrize("ocr_text", [
+    f"|: {ROUTING} |: {ACCOUNT} ||' 1043",       # bank line survived the mask
+    "Ref 0045-1237",                             # 8 digits with a separator
+], ids=["micr-line", "separated-digits"])
+def test_upload_with_visible_bank_numbers_is_refused(samples, tmp_path, monkeypatch, ocr_text):
+    _fake_ocr_string(monkeypatch, text=ocr_text)
+    dest = tmp_path / "uploads" / "7" / "check.png"
+    with pytest.raises(BankNumbersVisible):
+        save_masked_upload((samples / "01_check_robert_smith.png").read_bytes(), dest)
+    assert not dest.exists() and not (tmp_path / "uploads").exists()   # nothing written at all
+
+
+def test_upload_is_refused_when_it_cannot_be_checked(samples, tmp_path, monkeypatch):
+    """No Tesseract means the safety net can't run, so the scan isn't saved (fail closed)."""
+    _fake_ocr_string(monkeypatch, error=RuntimeError("tesseract is not installed"))
+    dest = tmp_path / "check.png"
+    with pytest.raises(BankNumbersVisible, match="Couldn't check"):
+        save_masked_upload((samples / "01_check_robert_smith.png").read_bytes(), dest)
+    assert not dest.exists()

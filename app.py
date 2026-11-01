@@ -12,6 +12,7 @@ import streamlit as st
 from giftflow.config import load_settings
 from giftflow.db import allowed_codes, connect, init_db, loads
 from giftflow.llm import get_extractor
+from giftflow.ocr import BankNumbersVisible, save_masked_upload
 from giftflow.pipeline import create_batch, process_batch
 from giftflow.posting import export_gift_csv, post_batch, reconcile
 from giftflow.review import ApprovalBlocked, accuracy_metrics, approve, create_donor_for_document, reject
@@ -99,9 +100,12 @@ with tab_intake:
             folder = UPLOADS / str(new_id)
             folder.mkdir(parents=True, exist_ok=True)
             for f in uploads:
-                p = folder / f.name
-                p.write_bytes(f.getbuffer())
-                paths.append(p)
+                try:  # only the masked scan is written; the original stays in memory
+                    paths.append(save_masked_upload(f.getvalue(), folder / Path(f.name).name))
+                except BankNumbersVisible as e:
+                    st.error(str(e))
+                except Exception as e:  # noqa: BLE001 - e.g. not a readable image
+                    st.error(f"Couldn't read {f.name} as an image ({e}); not saved.")
         if not paths:
             st.error("Add at least one image.")
         else:
@@ -208,10 +212,15 @@ with tab_review:
                             donor_confirmed = st.checkbox(
                                 "I've verified this donor (the AI picked it without its search returning it)",
                                 key=f"dconf_{r['id']}")
+                        coding_confirmed = False
+                        if any(f["code"] == "coding_ai_chosen" for f in fl):
+                            coding_confirmed = st.checkbox(
+                                "I've checked the fund and campaign (chosen by the AI, not a rule)",
+                                key=f"cconf_{r['id']}")
                         amount_confirmed = False
-                        if any(f["code"] == "amount_not_in_ocr" for f in fl):
+                        if any(f["code"] in ("amount_not_in_ocr", "amount_multiple_in_ocr") for f in fl):
                             amount_confirmed = st.checkbox(
-                                "I've verified this amount against the image (it doesn't match the scanned text)",
+                                "I've verified this amount against the image",
                                 key=f"aconf_{r['id']}")
                         b1, b2 = st.columns(2)
                         do_approve = b1.form_submit_button("Approve", type="primary")
@@ -228,7 +237,8 @@ with tab_review:
                             final.update(item_description=item or None, quantity=int(qty) if qty else None, stated_value=val)
                         try:
                             approve(conn, r["id"], final, reviewer, settings, donor_confirmed=donor_confirmed,
-                                    amount_confirmed=amount_confirmed)
+                                    amount_confirmed=amount_confirmed,
+                                    coding_confirmed=coding_confirmed)
                             st.rerun()
                         except ApprovalBlocked as e:
                             for f in e.flags:
