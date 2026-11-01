@@ -208,6 +208,11 @@ with tab_review:
                             donor_confirmed = st.checkbox(
                                 "I've verified this donor (the AI picked it without its search returning it)",
                                 key=f"dconf_{r['id']}")
+                        amount_confirmed = False
+                        if any(f["code"] == "amount_not_in_ocr" for f in fl):
+                            amount_confirmed = st.checkbox(
+                                "I've verified this amount against the image (it doesn't match the scanned text)",
+                                key=f"aconf_{r['id']}")
                         b1, b2 = st.columns(2)
                         do_approve = b1.form_submit_button("Approve", type="primary")
                         do_reject = b2.form_submit_button("Reject (rescan / not a gift)")
@@ -222,7 +227,8 @@ with tab_review:
                         else:
                             final.update(item_description=item or None, quantity=int(qty) if qty else None, stated_value=val)
                         try:
-                            approve(conn, r["id"], final, reviewer, settings, donor_confirmed=donor_confirmed)
+                            approve(conn, r["id"], final, reviewer, settings, donor_confirmed=donor_confirmed,
+                                    amount_confirmed=amount_confirmed)
                             st.rerun()
                         except ApprovalBlocked as e:
                             for f in e.flags:

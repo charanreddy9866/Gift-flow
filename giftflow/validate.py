@@ -5,10 +5,11 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import date, timedelta
 
-from .amounts import words_to_amount
+from .amounts import parse_money, words_to_amount
 from .db import allowed_codes, loads
 from .models import DonorCandidate, Flag
 
@@ -60,6 +61,14 @@ def find_duplicates(conn: sqlite3.Connection, p: dict, document_id: int | None) 
     return flags
 
 
+_OCR_DOLLARS = re.compile(r"\$\s*(\d[\d,]*(?:\.\d{2})?)")
+
+
+def ocr_dollar_amounts(text: str | None) -> list[float]:
+    """Every '$ 1,250.00'-style amount printed in the OCR text."""
+    return [v for v in (parse_money(m) for m in _OCR_DOLLARS.findall(text or "")) if v is not None]
+
+
 def searched_donor_ids(tool_calls: list[dict] | None) -> set[int]:
     """Donor IDs that the AI's own search_donors calls actually returned."""
     ids: set[int] = set()
@@ -75,10 +84,17 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
              match_threshold: float = 85, ai_conf_threshold: float = 0.8,
              ocr_conf_threshold: float = 70, document_id: int | None = None,
              ai_donor_id: int | None = None, tool_calls: list[dict] | None = None,
-             donor_confirmed: bool = False, today: date | None = None) -> list[Flag]:
+             donor_confirmed: bool = False, ocr_text: str | None = None,
+             ai_amount: float | None = None, amount_confirmed: bool = False,
+             today: date | None = None) -> list[Flag]:
     """`ai_donor_id` and `tool_calls` are the AI's raw donor choice and its function
     calls. When given, an AI-chosen donor must be one its own search returned, unless
-    a reviewer has confirmed that donor (`donor_confirmed`)."""
+    a reviewer has confirmed that donor (`donor_confirmed`).
+
+    `ocr_text` and `ai_amount`: when given, an AI-proposed check amount must appear as a
+    dollar amount in the OCR text. An amount the reviewer typed in is not checked, and a
+    reviewer who has verified the AI's amount against the image can confirm it
+    (`amount_confirmed`), e.g. when OCR misread the digits."""
     flags: list[Flag] = []
     today = today or date.today()
     funds, campaigns = allowed_codes(conn)
@@ -101,6 +117,23 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
         elif words_value is not None and abs(words_value - amount) > 0.009:
             flags.append(_block("amount_mismatch",
                                 f"Amount box says ${amount:,.2f} but the written amount says ${words_value:,.2f}. Check the image."))
+        # The model supplies both the amount box and the written amount, so they can agree
+        # and still be invented (e.g. by a prompt injection). Check against what OCR read.
+        if ocr_text and ai_amount is not None and abs(amount - ai_amount) <= 0.009:
+            printed = ocr_dollar_amounts(ocr_text)
+            if not printed:
+                flags.append(_warn("amount_not_in_ocr_unverified",
+                                   "Couldn't find a dollar amount in the OCR text to cross-check. Check the image."))
+            elif not any(abs(v - amount) <= 0.009 for v in printed):
+                shown = ", ".join(f"${v:,.2f}" for v in printed[:3])
+                if amount_confirmed:
+                    flags.append(_warn("amount_not_in_ocr",
+                                       f"The AI says ${amount:,.2f} but the scanned text shows {shown}; "
+                                       "a reviewer confirmed the amount from the image."))
+                else:
+                    flags.append(_block("amount_not_in_ocr",
+                                        f"The AI says ${amount:,.2f}, but the scanned text shows {shown}. "
+                                        "Check the image: enter the amount yourself, or confirm you've verified it."))
 
     # --- OCR confidence (digits matter most: they are amounts and dates)
     low = low_conf_words or []

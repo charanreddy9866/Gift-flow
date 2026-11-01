@@ -23,11 +23,13 @@ class ApprovalBlocked(Exception):
 
 
 def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, settings: Settings,
-            donor_confirmed: bool = False) -> list[Flag]:
+            donor_confirmed: bool = False, amount_confirmed: bool = False) -> list[Flag]:
     """Re-validate the reviewer's version. Blocks approval if any blocking issue remains.
 
     `donor_confirmed`: the reviewer ticked "I've verified this donor", which lets an AI
-    donor pick that its own search never returned through (and is audited)."""
+    donor pick that its own search never returned through (and is audited).
+    `amount_confirmed`: the reviewer ticked "I've verified this amount", which lets an AI
+    amount that doesn't appear in the OCR text through (and is audited)."""
     row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
     if row is None:
         raise ValueError(f"document {doc_id} not found")
@@ -39,12 +41,17 @@ def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, s
     flags = validate(conn, merged, candidates=candidates, match_threshold=settings.match_threshold,
                      ai_conf_threshold=settings.ai_conf_threshold, document_id=doc_id,
                      ai_donor_id=loads(row["extraction"], {}).get("suggested_donor_id"),
-                     tool_calls=loads(row["tool_calls"], []), donor_confirmed=donor_confirmed)
+                     tool_calls=loads(row["tool_calls"], []), donor_confirmed=donor_confirmed,
+                     ocr_text=row["ocr_text"], ai_amount=loads(row["extraction"], {}).get("amount"),
+                     amount_confirmed=amount_confirmed)
     if has_blockers(flags):
         raise ApprovalBlocked(flags)
     if donor_confirmed and any(f.code == "donor_not_searched" for f in flags):
         audit(conn, reviewer, "donor_confirmed_unsearched", "document", doc_id,
               {"donor_id": merged.get("suggested_donor_id")})
+    if amount_confirmed and any(f.code == "amount_not_in_ocr" for f in flags):
+        audit(conn, reviewer, "amount_confirmed_not_in_ocr", "document", doc_id,
+              {"amount": merged.get("amount")})
     corrections = [f for f in TRACKED_FIELDS if proposal.get(f) != merged.get(f)]
     conn.execute(
         "UPDATE documents SET status='approved', final=?, corrections=?, flags=?, reviewer=?, reviewed_at=? WHERE id=?",
@@ -81,7 +88,8 @@ def create_donor_for_document(conn: sqlite3.Connection, doc_id: int, name: str, 
                      match_threshold=settings.match_threshold, ai_conf_threshold=settings.ai_conf_threshold,
                      ocr_conf_threshold=settings.ocr_conf_threshold, document_id=doc_id,
                      ai_donor_id=loads(row["extraction"], {}).get("suggested_donor_id"),
-                     tool_calls=loads(row["tool_calls"], []))
+                     tool_calls=loads(row["tool_calls"], []),
+                     ocr_text=row["ocr_text"], ai_amount=loads(row["extraction"], {}).get("amount"))
     conn.execute("UPDATE documents SET proposal=?, candidates=?, flags=? WHERE id=?",
                  (json.dumps(proposal), json.dumps([c.model_dump() for c in candidates]),
                   json.dumps([f.model_dump() for f in flags]), doc_id))

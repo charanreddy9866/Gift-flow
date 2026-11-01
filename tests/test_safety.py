@@ -228,3 +228,45 @@ def test_confirming_a_nonexistent_donor_still_blocks(conn, settings, tmp_path, m
     assert any(f.code == "donor_not_found" and f.severity == "block" for f in blocked.value.flags)
     assert conn.execute("SELECT status FROM documents WHERE id=?", (row["id"],)).fetchone()["status"] == "needs_review"
     assert not conn.execute("SELECT 1 FROM audit_log WHERE action='donor_confirmed_unsearched'").fetchall()
+
+
+def test_reviewer_corrected_amount_is_not_cross_checked(conn, settings, tmp_path, monkeypatch):
+    """The OCR cross-check is on the AI's amount. Once the reviewer types the amount from
+    the image, approval goes through even though the AI's figure was blocked."""
+    answer = {**FINAL, "amount": 9999.0, "amount_words": "Nine thousand nine hundred ninety-nine and 00/100"}
+    row = _run(conn, settings, tmp_path, monkeypatch, answer)
+    assert "amount_not_in_ocr" in {f["code"] for f in loads(row["flags"], [])}
+    approve(conn, row["id"], {"amount": 250.0, "amount_words": "Two hundred fifty and 00/100"},
+            "reviewer", settings)
+
+
+def test_ocr_dollar_amounts():
+    from giftflow.validate import ocr_dollar_amounts
+    assert ocr_dollar_amounts("PAY TO $ 1,250.00\nValue: $300") == [1250.0, 300.0]
+    assert ocr_dollar_amounts("Value (provided by donor): $ ") == []
+    assert ocr_dollar_amounts(None) == []
+
+
+def test_reviewer_can_confirm_an_amount_ocr_misread(conn, settings, tmp_path, monkeypatch):
+    """OCR read '$ 25O.00' (letter O), so the scan shows $25 while the AI correctly says
+    $250. Typing $250 is still the AI's figure, so it stays blocked; ticking "I've verified
+    this amount" lets it through, and the audit log records that."""
+    lines = [ln.replace("$ 250.00", "$ 25O.00") for ln in CHECK_LINES]
+    row = _run(conn, settings, tmp_path, monkeypatch, FINAL, lines)
+
+    def confirmations():
+        return conn.execute("SELECT * FROM audit_log WHERE action='amount_confirmed_not_in_ocr' "
+                            "AND entity_id=?", (row["id"],)).fetchall()
+
+    with pytest.raises(ApprovalBlocked) as blocked:
+        approve(conn, row["id"], {"amount": 250.0}, "reviewer", settings)
+    assert any(f.code == "amount_not_in_ocr" and f.severity == "block" for f in blocked.value.flags)
+    assert not confirmations()
+
+    flags = approve(conn, row["id"], {"amount": 250.0}, "reviewer", settings, amount_confirmed=True)
+    assert any(f.code == "amount_not_in_ocr" and f.severity == "warn" for f in flags)
+    doc = conn.execute("SELECT status, final FROM documents WHERE id=?", (row["id"],)).fetchone()
+    assert doc["status"] == "approved" and loads(doc["final"])["amount"] == 250.0
+    logged = confirmations()
+    assert len(logged) == 1
+    assert logged[0]["actor"] == "reviewer" and json.loads(logged[0]["details"]) == {"amount": 250.0}
