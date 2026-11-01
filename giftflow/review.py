@@ -33,7 +33,9 @@ def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, s
     merged = {**proposal, **final}
     candidates = search_donors(conn, merged.get("donor_name"), merged.get("address"))
     flags = validate(conn, merged, candidates=candidates, match_threshold=settings.match_threshold,
-                     ai_conf_threshold=settings.ai_conf_threshold, document_id=doc_id)
+                     ai_conf_threshold=settings.ai_conf_threshold, document_id=doc_id,
+                     ai_donor_id=loads(row["extraction"], {}).get("suggested_donor_id"),
+                     tool_calls=loads(row["tool_calls"], []))
     if has_blockers(flags):
         raise ApprovalBlocked(flags)
     corrections = [f for f in TRACKED_FIELDS if proposal.get(f) != merged.get(f)]
@@ -70,7 +72,9 @@ def create_donor_for_document(conn: sqlite3.Connection, doc_id: int, name: str, 
     flags = validate(conn, proposal, candidates=candidates, ocr_confidence=row["ocr_confidence"],
                      low_conf_words=loads(row["low_conf_words"], []),
                      match_threshold=settings.match_threshold, ai_conf_threshold=settings.ai_conf_threshold,
-                     ocr_conf_threshold=settings.ocr_conf_threshold, document_id=doc_id)
+                     ocr_conf_threshold=settings.ocr_conf_threshold, document_id=doc_id,
+                     ai_donor_id=loads(row["extraction"], {}).get("suggested_donor_id"),
+                     tool_calls=loads(row["tool_calls"], []))
     conn.execute("UPDATE documents SET proposal=?, candidates=?, flags=? WHERE id=?",
                  (json.dumps(proposal), json.dumps([c.model_dump() for c in candidates]),
                   json.dumps([f.model_dump() for f in flags]), doc_id))

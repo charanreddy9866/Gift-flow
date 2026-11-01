@@ -66,7 +66,8 @@ def process_document(conn: sqlite3.Connection, batch_id: int, image_path: str | 
     flags = validate(conn, proposal, candidates=candidates, ocr_confidence=ocr.mean_confidence,
                      low_conf_words=ocr.low_conf_words, match_threshold=settings.match_threshold,
                      ai_conf_threshold=settings.ai_conf_threshold,
-                     ocr_conf_threshold=settings.ocr_conf_threshold)
+                     ocr_conf_threshold=settings.ocr_conf_threshold,
+                     ai_donor_id=extraction_dict.get("suggested_donor_id"), tool_calls=tool_calls)
     from .models import Flag
     if error:
         flags.insert(0, Flag(code="extraction_failed", severity="block",
