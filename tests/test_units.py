@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -6,7 +6,7 @@ from giftflow.amounts import parse_money, words_to_amount
 from giftflow.coding import rule_coding
 from giftflow.matching import normalize_name, search_donors
 from giftflow.ocr import redact_bank_numbers
-from giftflow.validate import validate
+from giftflow.validate import STALE_CHECK_DAYS, has_blockers, validate
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -77,9 +77,39 @@ def test_amount_mismatch_blocks(conn):
     assert "amount_mismatch" in codes(f)
 
 
-def test_future_date_blocks_and_old_check_warns(conn):
+def test_future_date_blocks_and_old_check_blocks(conn):
     assert "date_future" in codes(validate(conn, _check(date="2027-01-01"), today=date(2026, 10, 25)))
-    assert "stale_check" in codes(validate(conn, _check(date="2026-01-02"), today=date(2026, 10, 25)))
+    f = validate(conn, _check(date="2026-01-02"), today=date(2026, 10, 25))
+    assert any(x.code == "stale_check" and x.severity == "block" for x in f)
+
+
+TODAY = date(2026, 10, 25)
+
+
+def _days_ago(n):
+    return (TODAY - timedelta(days=n)).isoformat()
+
+
+def test_check_exactly_180_days_old_passes(conn):
+    cands = search_donors(conn, "Robert Smith", "412 Palm Ave, Miami, FL 33130")
+    assert validate(conn, _check(date=_days_ago(STALE_CHECK_DAYS)), candidates=cands, today=TODAY) == []
+
+
+def test_check_181_days_old_is_blocked(conn):
+    f = validate(conn, _check(date=_days_ago(STALE_CHECK_DAYS + 1)), today=TODAY)
+    stale = [x for x in f if x.code == "stale_check"]
+    assert len(stale) == 1 and stale[0].severity == "block"
+    assert has_blockers(f)
+
+
+def test_gik_181_days_old_is_not_blocked(conn):
+    p = {"doc_type": "gik", "donor_name": "Grace Community Church", "item_description": "Winter coats",
+         "quantity": 40, "stated_value": 800.0, "date": _days_ago(STALE_CHECK_DAYS + 1),
+         "suggested_donor_id": 6, "suggested_fund": "SHELTER", "suggested_campaign": "ANNUAL-2026",
+         "coding_source": "rule"}
+    f = validate(conn, p, today=TODAY)
+    assert "stale_check" not in codes(f)
+    assert not has_blockers(f)
 
 
 def test_invalid_fund_blocks(conn):

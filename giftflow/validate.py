@@ -169,7 +169,7 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
             if d > today:
                 flags.append(_block("date_future", f"Date {d} is in the future."))
             elif is_check and today - d > timedelta(days=STALE_CHECK_DAYS):
-                flags.append(_warn("stale_check", f"Check is dated {d}, more than {STALE_CHECK_DAYS} days ago."))
+                flags.append(_block("stale_check", f"Check is dated {d}, more than {STALE_CHECK_DAYS} days ago."))
         except ValueError:
             flags.append(_block("date_invalid", f"Date '{p['date']}' isn't a valid date."))
 
