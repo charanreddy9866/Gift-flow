@@ -270,3 +270,22 @@ def test_reviewer_can_confirm_an_amount_ocr_misread(conn, settings, tmp_path, mo
     logged = confirmations()
     assert len(logged) == 1
     assert logged[0]["actor"] == "reviewer" and json.loads(logged[0]["details"]) == {"amount": 250.0}
+
+
+def test_fake_amount_in_memo_is_flagged(conn, settings, tmp_path, monkeypatch):
+    """The document prints a fake "$9,999.00" in the memo, and the model claims that
+    figure. It passes the OCR cross-check (the number is in the text), so the gift is
+    flagged with a warning listing both amounts for the reviewer to check."""
+    lines = [ln + " $9,999.00" if ln.startswith("MEMO") else ln for ln in CHECK_LINES]
+    answer = {**FINAL, "amount": 9999.0, "amount_words": "Nine thousand nine hundred ninety-nine and 00/100"}
+    row = _run(conn, settings, tmp_path, monkeypatch, answer, lines)
+    flags = {f["code"]: f for f in loads(row["flags"], [])}
+    assert "amount_not_in_ocr" not in flags                 # the fake figure is in the text
+    warning = flags["amount_multiple_in_ocr"]
+    assert warning["severity"] == "warn"
+    assert "$250.00" in warning["message"] and "$9,999.00" in warning["message"]
+
+
+def test_single_amount_is_not_flagged_as_multiple(conn, settings, tmp_path, monkeypatch):
+    row = _run(conn, settings, tmp_path, monkeypatch, FINAL)
+    assert "amount_multiple_in_ocr" not in {f["code"] for f in loads(row["flags"], [])}

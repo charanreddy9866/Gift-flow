@@ -117,6 +117,14 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
         elif words_value is not None and abs(words_value - amount) > 0.009:
             flags.append(_block("amount_mismatch",
                                 f"Amount box says ${amount:,.2f} but the written amount says ${words_value:,.2f}. Check the image."))
+        # More than one amount on a check (e.g. a fake one in the memo) means the OCR
+        # cross-check below can be satisfied by the wrong figure. Make a person look.
+        distinct = sorted({round(v, 2) for v in ocr_dollar_amounts(ocr_text)})
+        if len(distinct) > 1:
+            flags.append(_warn("amount_multiple_in_ocr",
+                               "The scanned text shows more than one dollar amount: "
+                               + ", ".join(f"${v:,.2f}" for v in distinct)
+                               + ". Check the image for the real check amount."))
         # The model supplies both the amount box and the written amount, so they can agree
         # and still be invented (e.g. by a prompt injection). Check against what OCR read.
         if ocr_text and ai_amount is not None and abs(amount - ai_amount) <= 0.009:
