@@ -75,9 +75,10 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
              match_threshold: float = 85, ai_conf_threshold: float = 0.8,
              ocr_conf_threshold: float = 70, document_id: int | None = None,
              ai_donor_id: int | None = None, tool_calls: list[dict] | None = None,
-             today: date | None = None) -> list[Flag]:
+             donor_confirmed: bool = False, today: date | None = None) -> list[Flag]:
     """`ai_donor_id` and `tool_calls` are the AI's raw donor choice and its function
-    calls. When given, an AI-chosen donor must be one its own search returned."""
+    calls. When given, an AI-chosen donor must be one its own search returned, unless
+    a reviewer has confirmed that donor (`donor_confirmed`)."""
     flags: list[Flag] = []
     today = today or date.today()
     funds, campaigns = allowed_codes(conn)
@@ -136,12 +137,18 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
                                f"Two similar donors: {candidates[0].name} and {candidates[1].name}."))
     # The AI may only pick a donor its own search returned. A different ID (e.g. from a
     # prompt injection) is blocked; a donor the reviewer picks themselves is not checked.
+    # A reviewer who has verified the AI's pick can confirm it, which turns this into a warning.
     chosen_id = p.get("suggested_donor_id")
     if (tool_calls is not None and ai_donor_id is not None and chosen_id == ai_donor_id
             and chosen_id not in searched_donor_ids(tool_calls)):
-        flags.append(_block("donor_not_searched",
-                            f"The AI chose donor #{chosen_id}, but its donor search never returned that donor. "
-                            "Pick the donor yourself."))
+        if donor_confirmed:
+            flags.append(_warn("donor_not_searched",
+                               f"The AI chose donor #{chosen_id} without its search returning it; "
+                               "a reviewer confirmed this donor."))
+        else:
+            flags.append(_block("donor_not_searched",
+                                f"The AI chose donor #{chosen_id}, but its donor search never returned that donor. "
+                                "Pick the donor yourself, or confirm you've verified this one."))
 
     # --- coding
     fund, campaign = p.get("suggested_fund"), p.get("suggested_campaign")

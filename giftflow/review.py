@@ -22,8 +22,12 @@ class ApprovalBlocked(Exception):
         super().__init__("; ".join(f.message for f in flags if f.severity == "block"))
 
 
-def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, settings: Settings) -> list[Flag]:
-    """Re-validate the reviewer's version. Blocks approval if any blocking issue remains."""
+def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, settings: Settings,
+            donor_confirmed: bool = False) -> list[Flag]:
+    """Re-validate the reviewer's version. Blocks approval if any blocking issue remains.
+
+    `donor_confirmed`: the reviewer ticked "I've verified this donor", which lets an AI
+    donor pick that its own search never returned through (and is audited)."""
     row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
     if row is None:
         raise ValueError(f"document {doc_id} not found")
@@ -35,9 +39,12 @@ def approve(conn: sqlite3.Connection, doc_id: int, final: dict, reviewer: str, s
     flags = validate(conn, merged, candidates=candidates, match_threshold=settings.match_threshold,
                      ai_conf_threshold=settings.ai_conf_threshold, document_id=doc_id,
                      ai_donor_id=loads(row["extraction"], {}).get("suggested_donor_id"),
-                     tool_calls=loads(row["tool_calls"], []))
+                     tool_calls=loads(row["tool_calls"], []), donor_confirmed=donor_confirmed)
     if has_blockers(flags):
         raise ApprovalBlocked(flags)
+    if donor_confirmed and any(f.code == "donor_not_searched" for f in flags):
+        audit(conn, reviewer, "donor_confirmed_unsearched", "document", doc_id,
+              {"donor_id": merged.get("suggested_donor_id")})
     corrections = [f for f in TRACKED_FIELDS if proposal.get(f) != merged.get(f)]
     conn.execute(
         "UPDATE documents SET status='approved', final=?, corrections=?, flags=?, reviewer=?, reviewed_at=? WHERE id=?",

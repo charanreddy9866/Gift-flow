@@ -203,6 +203,11 @@ with tab_review:
                         c3, c4 = st.columns(2)
                         fund = c3.selectbox("Fund", funds, index=funds.index(p["suggested_fund"]) if p.get("suggested_fund") in funds else 0, key=f"f_{r['id']}")
                         camp = c4.selectbox("Campaign", campaigns, index=campaigns.index(p["suggested_campaign"]) if p.get("suggested_campaign") in campaigns else 0, key=f"c_{r['id']}")
+                        donor_confirmed = False
+                        if any(f["code"] == "donor_not_searched" for f in fl):
+                            donor_confirmed = st.checkbox(
+                                "I've verified this donor (the AI picked it without its search returning it)",
+                                key=f"dconf_{r['id']}")
                         b1, b2 = st.columns(2)
                         do_approve = b1.form_submit_button("Approve", type="primary")
                         do_reject = b2.form_submit_button("Reject (rescan / not a gift)")
@@ -217,7 +222,7 @@ with tab_review:
                         else:
                             final.update(item_description=item or None, quantity=int(qty) if qty else None, stated_value=val)
                         try:
-                            approve(conn, r["id"], final, reviewer, settings)
+                            approve(conn, r["id"], final, reviewer, settings, donor_confirmed=donor_confirmed)
                             st.rerun()
                         except ApprovalBlocked as e:
                             for f in e.flags:

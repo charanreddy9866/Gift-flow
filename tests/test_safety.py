@@ -192,3 +192,26 @@ def test_forced_full_confidence_does_not_skip_review(conn, settings, tmp_path, m
     row = _run(conn, settings, tmp_path, monkeypatch, answer, lines)
     assert loads(row["proposal"])["coding_source"] == "ai"
     _assert_blocked(conn, settings, row)
+
+
+def test_reviewer_can_confirm_an_unsearched_donor(conn, settings, tmp_path, monkeypatch):
+    """Donor #3 never came back from the AI's search. Approving it unchanged is blocked;
+    ticking "I've verified this donor" lets it through, and the audit log records that."""
+    row = _run(conn, settings, tmp_path, monkeypatch, {**FINAL, "suggested_donor_id": 3})
+
+    def confirmations():
+        return conn.execute("SELECT * FROM audit_log WHERE action='donor_confirmed_unsearched' "
+                            "AND entity_id=?", (row["id"],)).fetchall()
+
+    with pytest.raises(ApprovalBlocked) as blocked:
+        approve(conn, row["id"], {"suggested_donor_id": 3}, "reviewer", settings)
+    assert any(f.code == "donor_not_searched" and f.severity == "block" for f in blocked.value.flags)
+    assert not confirmations()
+
+    flags = approve(conn, row["id"], {"suggested_donor_id": 3}, "reviewer", settings, donor_confirmed=True)
+    assert any(f.code == "donor_not_searched" and f.severity == "warn" for f in flags)
+    doc = conn.execute("SELECT status, final FROM documents WHERE id=?", (row["id"],)).fetchone()
+    assert doc["status"] == "approved" and loads(doc["final"])["suggested_donor_id"] == 3
+    logged = confirmations()
+    assert len(logged) == 1
+    assert logged[0]["actor"] == "reviewer" and json.loads(logged[0]["details"]) == {"donor_id": 3}
