@@ -139,6 +139,10 @@ def validate(conn: sqlite3.Connection, p: dict, *, candidates: list[DonorCandida
     # prompt injection) is blocked; a donor the reviewer picks themselves is not checked.
     # A reviewer who has verified the AI's pick can confirm it, which turns this into a warning.
     chosen_id = p.get("suggested_donor_id")
+    # Whoever chose it, the donor must exist. Confirmation can't override this.
+    if chosen_id and conn.execute("SELECT 1 FROM donors WHERE id=?", (chosen_id,)).fetchone() is None:
+        flags.append(_block("donor_not_found",
+                            f"Donor #{chosen_id} doesn't exist in the donor database. Pick an existing donor."))
     if (tool_calls is not None and ai_donor_id is not None and chosen_id == ai_donor_id
             and chosen_id not in searched_donor_ids(tool_calls)):
         if donor_confirmed:

@@ -215,3 +215,16 @@ def test_reviewer_can_confirm_an_unsearched_donor(conn, settings, tmp_path, monk
     logged = confirmations()
     assert len(logged) == 1
     assert logged[0]["actor"] == "reviewer" and json.loads(logged[0]["details"]) == {"donor_id": 3}
+
+
+def test_confirming_a_nonexistent_donor_still_blocks(conn, settings, tmp_path, monkeypatch):
+    """Donor #999 doesn't exist. Ticking "I've verified this donor" must not let it through,
+    and no confirmation is logged because nothing was approved."""
+    row = _run(conn, settings, tmp_path, monkeypatch, {**FINAL, "suggested_donor_id": 999})
+    assert "donor_not_found" in {f["code"] for f in loads(row["flags"], []) if f["severity"] == "block"}
+
+    with pytest.raises(ApprovalBlocked) as blocked:
+        approve(conn, row["id"], {"suggested_donor_id": 999}, "reviewer", settings, donor_confirmed=True)
+    assert any(f.code == "donor_not_found" and f.severity == "block" for f in blocked.value.flags)
+    assert conn.execute("SELECT status FROM documents WHERE id=?", (row["id"],)).fetchone()["status"] == "needs_review"
+    assert not conn.execute("SELECT 1 FROM audit_log WHERE action='donor_confirmed_unsearched'").fetchall()
